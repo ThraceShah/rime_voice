@@ -1,0 +1,21 @@
+{
+  "name": "rime_voice",
+  "version": "1.0.0",
+  "description": "ChromeOS Rime 拼音与可配置 AI 语音输入法",
+  "type": "module",
+  "scripts": {
+    "prebuild": "node scripts/prepare_assets.js",
+    "build": "node scripts/build.js",
+    "pretest": "node scripts/prepare_assets.js",
+    "test": "node scripts/test_local.js && node scripts/test_alt_hold.js && node scripts/test_shift_toggle.js && node scripts/test_rime.js && node scripts/test_ime_modes.js && node scripts/test_long_recording.js && node scripts/test_gemini_recorder.js && node scripts/test_provider_fallback.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "GPL-3.0-only",
+  "dependencies": {
+    "jsh_rime": "^2.0.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+*.pem
+*.key
+*.crx
+*.log
+.DS_Store
+*.wav
+!scripts/fixtures/english_test.wav
+vendor/rime/*.bin
+vendor/rime/rime-api.wasm
+vendor/rime/rime-api.data

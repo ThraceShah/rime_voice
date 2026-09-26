@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Rime Voice 输入法",
+  "version": "0.5.1",
+  "description": "ChromeOS 拼音与可配置 AI 语音输入",
+  "minimum_chrome_version": "116",
+  "permissions": ["input", "offscreen", "storage", "notifications"],
+  "host_permissions": ["https://*/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "options_page": "options.html",
+  "input_components": [{ "name": "Rime Voice 拼音", "id": "rime_mimo_ime", "language": "zh-CN", "layouts": ["us"] }],
+  "content_security_policy": { "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https:" },
+  "icons": { "128": "icon.png" }
+}
