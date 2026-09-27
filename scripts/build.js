@@ -7,6 +7,7 @@ await Promise.all([
   cp('manifest.json', 'dist/manifest.json'),
   cp('options.html', 'dist/options.html'),
   cp('offscreen.html', 'dist/offscreen.html'),
+  cp('src/offscreen/capture-worklet.js', 'dist/capture-worklet.js'),
   cp('icon.png', 'dist/icon.png'),
   cp('LICENSE', 'dist/LICENSE'),
   cp('THIRD_PARTY_NOTICES.md', 'dist/THIRD_PARTY_NOTICES.md'),

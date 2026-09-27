@@ -1,21 +1,17 @@
 import assert from 'node:assert/strict';
+import { installAudioWorkletMock } from './mock_audio_worklet.js';
 
-let listener, processor, requestCount = 0;
+let listener, requestCount = 0;
 const messages = [];
 globalThis.chrome = { runtime: {
+  getURL: path => `chrome-extension://test/${path}`,
   onMessage: { addListener: callback => { listener = callback; } },
   sendMessage: async message => { messages.push(message); }
 } };
 Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { mediaDevices: {
   getUserMedia: async () => ({ getTracks: () => [{ stop: () => {} }] })
 } } });
-globalThis.AudioContext = class {
-  sampleRate = 16000;
-  destination = {};
-  createMediaStreamSource() { return { connect: () => {}, disconnect: () => {} }; }
-  createScriptProcessor() { processor = { connect: () => {}, disconnect: () => {}, onaudioprocess: null }; return processor; }
-  async close() {}
-};
+const audio = installAudioWorkletMock({ sampleRate: 16000 });
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (_url, options) => {
   requestCount++;
@@ -34,7 +30,7 @@ try {
   const settings = { provider: 'MiMo', apiKey: 'test', endpoint: 'https://example.com/v1/chat/completions', model: 'asr' };
   assert((await send({ type: 'start', sessionId: 'long-test', contextID: 3, trigger: 'toggle', settings })).ok);
   const frame = new Float32Array(4096).fill(0.08);
-  for (let i = 0; i < 352; i++) processor.onaudioprocess({ inputBuffer: { numberOfChannels: 1, length: frame.length, getChannelData: () => frame } });
+  for (let i = 0; i < 352; i++) audio.emit(frame);
   assert((await send({ type: 'status' })).data.recording);
   const stopped = await send({ type: 'stop' });
   assert(stopped.ok, '长录音必须可以立即停止');

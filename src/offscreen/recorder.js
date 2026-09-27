@@ -4,8 +4,8 @@ import { encodeWav, resample } from './wav.js';
 
 const SEGMENT_SECONDS = 75;
 const MAX_SESSION_MS = 595000;
-let stream, context, source, processor, chunks, session, heartbeat, limitTimer;
-let processing = false, aborter;
+let stream, context, source, processor, chunks, session, limitTimer;
+let processing = false, aborter, finishTask;
 
 function tellBackground(type, data = {}) {
   void chrome.runtime.sendMessage({ target: 'background', type, ...data }).catch(() => {});
@@ -21,17 +21,15 @@ async function start(message) {
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
     context = new AudioContext();
+    await context.audioWorklet.addModule(chrome.runtime.getURL('capture-worklet.js'));
     source = context.createMediaStreamSource(stream);
-    processor = context.createScriptProcessor(4096, 1, 1);
+    processor = new AudioWorkletNode(context, 'rime-voice-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
     chunks = [];
     let lastLevel = 0;
-    processor.onaudioprocess = event => {
-      const channels = event.inputBuffer.numberOfChannels;
-      const mono = new Float32Array(event.inputBuffer.length);
-      for (let channel = 0; channel < channels; channel++) {
-        const data = event.inputBuffer.getChannelData(channel);
-        for (let index = 0; index < mono.length; index++) mono[index] += data[index] / channels;
-      }
+    processor.port.onmessage = ({ data }) => {
+      if (data?.type === 'flushed') { processor.flushDone?.(data.id); return; }
+      if (data?.type !== 'audio') return;
+      const mono = data.samples;
       chunks.push(mono);
       const now = Date.now();
       if (now - lastLevel >= 140) {
@@ -43,32 +41,48 @@ async function start(message) {
     };
     source.connect(processor);
     processor.connect(context.destination);
-    heartbeat = setInterval(() => tellBackground('voice-heartbeat', { sessionId: session.id, contextID: session.contextID, trigger: session.trigger, recording: true }), 15000);
+    if (context.state === 'suspended') await context.resume();
     const remaining = Math.max(0, MAX_SESSION_MS - (Date.now() - session.startedAt));
     limitTimer = setTimeout(() => { void autoStop(); }, remaining);
     return status();
   } catch (error) {
-    clearTimeout(limitTimer); clearInterval(heartbeat);
+    clearTimeout(limitTimer);
     stream?.getTracks().forEach(track => track.stop());
     if (context) await context.close().catch(() => {});
     stream = context = source = processor = chunks = session = undefined;
     throw error;
   }
 }
-async function finishCapture() {
+function finishCapture() {
+  if (finishTask) return finishTask;
   if (!stream) throw new Error('没有正在进行的录音');
-  clearInterval(heartbeat); clearTimeout(limitTimer); heartbeat = limitTimer = undefined;
-  processor.onaudioprocess = null;
-  processor.disconnect(); source.disconnect();
-  stream.getTracks().forEach(track => track.stop());
-  const captured = { chunks, sourceRate: context.sampleRate, session };
-  const closed = context.close();
-  stream = context = source = processor = chunks = undefined;
-  await closed;
-  return captured;
+  finishTask = (async () => {
+    clearTimeout(limitTimer); limitTimer = undefined;
+    stream.getTracks().forEach(track => track.stop());
+    source.disconnect();
+    await new Promise(resolve => {
+      const id = Math.random();
+      const timer = setTimeout(resolve, 300);
+      processor.flushDone = replyId => {
+        if (replyId !== id) return;
+        clearTimeout(timer);
+        resolve();
+      };
+      processor.port.postMessage({ type: 'flush', id });
+    });
+    processor.port.onmessage = null;
+    processor.port.close();
+    processor.disconnect();
+    const captured = { chunks, sourceRate: context.sampleRate, session };
+    const closed = context.close();
+    stream = context = source = processor = chunks = undefined;
+    await closed;
+    return captured;
+  })().finally(() => { finishTask = undefined; });
+  return finishTask;
 }
 async function autoStop() {
-  if (!stream) return;
+  if (!stream || finishTask) return;
   try {
     const capture = await finishCapture();
     processing = true;
@@ -143,7 +157,9 @@ async function processCapture(capture, settings) {
   }
 }
 async function cancel() {
-  if (stream) { await finishCapture(); session = undefined; }
+  if (finishTask) await finishTask;
+  else if (stream) await finishCapture();
+  session = undefined;
   aborter?.abort();
 }
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -153,6 +169,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'start') return sendResponse({ ok: true, data: await start(message) });
     if (message.type === 'cancel') { await cancel(); return sendResponse({ ok: true }); }
     if (message.type === 'stop') {
+      if (finishTask || processing) return sendResponse({ ok: true, data: { sessionId: session?.id } });
       const capture = await finishCapture();
       processing = true;
       sendResponse({ ok: true, data: { sessionId: capture.session.id } });

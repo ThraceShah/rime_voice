@@ -12,8 +12,9 @@ const modeReady = chrome.storage.local.get('inputMode')
   .finally(() => { modeLoaded = true; });
 let voice = 'idle', voiceContext = -1, voiceTrigger = null, generation = 0;
 let voiceSessionId = null, audioLevel = 0, progressText = '', lastLevelRender = 0, levelRenderPending = false;
-let queue = Promise.resolve(), creating;
+let queue = Promise.resolve(), creating, closing;
 let altLDown = false, pendingModeSwitches = 0;
+let latestFocus = null;
 const ime = chrome.input.ime;
 const sessionStore = chrome.storage.session || chrome.storage.local;
 
@@ -22,8 +23,13 @@ function notify(message) {
 }
 function enqueue(work) {
   const result = queue.then(work);
-  queue = result.catch(error => { console.error(error); notify(error.message || '输入法发生错误'); });
-  return result;
+  queue = result.catch(error => {
+    if (isFocusLoss(error)) { focusError(error, contextId); return true; }
+    console.error(error);
+    notify(error.message || '输入法发生错误');
+    return true;
+  });
+  return queue;
 }
 function voiceIndicator() {
   if (voice === 'processing') return `🎙 识别中${progressText}…`;
@@ -32,26 +38,40 @@ function voiceIndicator() {
   return `🎙 ${bars}  ${voiceTrigger === 'hold' ? '松开右 Alt 结束' : 'Alt+L 结束'}`;
 }
 function focusError(error, target) {
-  if (!/Context is not active/i.test(error?.message || '')) return error;
-  if (contextId === target) {
+  if (!isFocusLoss(error)) return error;
+  if (target >= 0 && contextId === target) {
     contextId = -1; active = false; generation++;
+    discardRecording();
     void sessionStore.remove('currentContextID').catch(() => {});
   }
-  return new Error('输入焦点已离开，请重新点击输入框');
+  const stale = new Error('输入焦点已离开');
+  stale.name = 'FocusLostError';
+  return stale;
+}
+function isFocusLoss(error) {
+  return error?.name === 'FocusLostError' || /Context is not active|engine is not active|IME is not active|input method is not active/i.test(error?.message || '');
+}
+function hasContext(target) { return active && target >= 0 && contextId === target; }
+async function commit(target, text) {
+  if (!hasContext(target)) return false;
+  try { await ime.commitText({ contextID: target, text }); return true; }
+  catch (error) { throw focusError(error, target); }
 }
 async function render() {
-  if (contextId < 0 || !active) return;
+  if (contextType === 'password' || !hasContext(contextId)) return;
   const target = contextId;
   const text = voice !== 'idle' ? voiceIndicator() : inputMode === 'en' ? '' : state ? [state.preeditHead, state.preeditBody, state.preeditTail].join('') || composition : composition;
   try {
     await ime.setComposition({ contextID: target, text, cursor: Array.from(text).length });
+    if (!hasContext(target)) return;
     const candidates = (voice !== 'idle' || inputMode === 'en' ? [] : state?.candidates || []).slice(0, 9).map((item, index) => ({ id: index, candidate: item.text, annotation: item.comment || '', label: `${index + 1}` }));
     await ime.setCandidates({ contextID: target, candidates });
+    if (!hasContext(target)) return;
     await ime.setCandidateWindowProperties({ engineID: ENGINE_ID, properties: {
       visible: voice === 'idle' && inputMode === 'zh' && !!composition, vertical: true, pageSize: 9,
       cursorVisible: candidates.length > 0, auxiliaryTextVisible: false
     } });
-    if (candidates.length) await ime.setCursorPosition({ contextID: target, candidateID: Math.min(state?.highlightedIndex || 0, candidates.length - 1) });
+    if (candidates.length && hasContext(target)) await ime.setCursorPosition({ contextID: target, candidateID: Math.min(state?.highlightedIndex || 0, candidates.length - 1) });
   } catch (error) { throw focusError(error, target); }
 }
 async function reset() {
@@ -62,7 +82,7 @@ async function reset() {
 async function switchInputMode() {
   await modeReady;
   if (inputMode === 'zh' && composition && contextId >= 0 && active) {
-    await ime.commitText({ contextID: contextId, text: composition });
+    await commit(contextId, composition);
   }
   composition = ''; state = null;
   await clear();
@@ -72,29 +92,52 @@ async function switchInputMode() {
 }
 async function pick(index) {
   if (!state?.candidates?.[index] || contextId < 0) return;
+  const target = contextId;
   const result = await select(index);
-  if (result?.committed) await ime.commitText({ contextID: contextId, text: result.committed });
+  if (result?.committed) await commit(target, result.committed);
   composition = ''; state = null;
   await clear(); await render();
 }
 async function ensureOffscreen() {
+  if (closing) await closing;
   const url = chrome.runtime.getURL('offscreen.html');
   if ((await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'], documentUrls: [url] })).length) return;
   if (!creating) creating = chrome.offscreen.createDocument({ url: 'offscreen.html', reasons: ['USER_MEDIA'], justification: 'Capture microphone audio for speech input' }).finally(() => { creating = undefined; });
   await creating;
 }
+async function hasOffscreen() {
+  const url = chrome.runtime.getURL('offscreen.html');
+  return (await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'], documentUrls: [url] })).length > 0;
+}
+async function closeOffscreen() {
+  if (closing) return closing;
+  closing = (async () => {
+    if (creating) await creating.catch(() => {});
+    if (voice !== 'idle' || !await hasOffscreen()) return;
+    const reply = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'status' }).catch(() => null);
+    if (reply?.data?.recording) return;
+    await chrome.offscreen.closeDocument();
+  })().catch(() => {}).finally(() => { closing = undefined; });
+  return closing;
+}
 async function recordMessage(type, data = {}) {
-  await ensureOffscreen();
+  if (type === 'start') await ensureOffscreen();
+  else {
+    if (closing) await closing;
+    if (creating) await creating.catch(() => {});
+    if (!await hasOffscreen()) return type === 'status' ? { recording: false, processing: false, session: null } : undefined;
+  }
   const reply = await chrome.runtime.sendMessage({ target: 'offscreen', type, ...data });
   if (!reply?.ok) throw new Error(reply?.error || '录音失败');
   return reply.data;
 }
 async function startVoice(trigger) {
   if (contextType === 'password' || !active || (trigger === 'hold' && !altHold.isDown())) return;
+  const requestGeneration = generation;
   if (contextId < 0) {
     const { currentContextID } = await sessionStore.get('currentContextID');
     if (Number.isInteger(currentContextID) && currentContextID >= 0) contextId = currentContextID;
-    else { notify('请重新点击输入框后再启动语音'); return; }
+    else return;
   }
   if (voice !== 'idle') return;
   const settings = { ...DEFAULTS, ...await chrome.storage.local.get(Object.keys(DEFAULTS)) };
@@ -102,6 +145,7 @@ async function startVoice(trigger) {
   if (settings.provider === 'Gemini' && !settings.geminiApiKey && settings.apiKey) settings.provider = 'MiMo';
   const key = settings.provider === 'Gemini' ? settings.geminiApiKey : settings.apiKey;
   if (!key) { notify(settings.provider === 'Gemini' ? '请先填写 Google AI Studio API Key' : '请先填写 MiMo API Key'); return; }
+  if (!active || contextId < 0 || generation !== requestGeneration) return;
   voiceContext = contextId;
   voiceTrigger = trigger;
   voiceSessionId = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -111,6 +155,8 @@ async function startVoice(trigger) {
   let recorderStarted = false;
   try {
     await sessionStore.set({ voiceSession: { id: voiceSessionId, contextID: voiceContext } });
+    await render();
+    if (token !== generation || !hasContext(voiceContext)) throw focusError(new Error('Context is not active'), voiceContext);
     await recordMessage('start', { sessionId: voiceSessionId, contextID: voiceContext, trigger, settings });
     recorderStarted = true;
     if (token !== generation || !active || voiceContext !== contextId || (trigger === 'hold' && !altHold.isDown())) {
@@ -121,10 +167,12 @@ async function startVoice(trigger) {
     }
     voice = 'recording'; await render();
   } catch (error) {
+    const stillFocused = token === generation && hasContext(voiceContext);
     if (recorderStarted) await recordMessage('cancel').catch(() => {});
     await sessionStore.remove('voiceSession').catch(() => {});
     voice = 'idle'; voiceContext = -1; voiceTrigger = voiceSessionId = null;
-    notify(error.name === 'NotAllowedError' ? '请允许麦克风访问' : `无法录音：${error.message}`);
+    void closeOffscreen();
+    if (stillFocused && !isFocusLoss(error)) notify(error.name === 'NotAllowedError' ? '请允许麦克风访问' : `无法录音：${error.message}`);
   }
 }
 async function stopVoice() {
@@ -134,10 +182,12 @@ async function stopVoice() {
     await render().catch(() => {});
     await recordMessage('stop');
   } catch (error) {
-    notify(`结束录音失败：${error.message}`);
+    if (hasContext(voiceContext) && !isFocusLoss(error)) notify(`结束录音失败：${error.message}`);
+    await recordMessage('cancel').catch(() => {});
     await sessionStore.remove('voiceSession').catch(() => {});
     voice = 'idle'; voiceContext = -1; voiceTrigger = voiceSessionId = null;
     await render();
+    void closeOffscreen();
   }
 }
 async function toggleVoice() {
@@ -172,22 +222,26 @@ function discardRecording() {
   if (voice === 'idle') return;
   voice = 'idle'; voiceContext = -1; voiceTrigger = voiceSessionId = null;
   void sessionStore.remove('voiceSession').catch(() => {});
-  void enqueue(async () => { try { await recordMessage('cancel'); } catch {} });
+  void enqueue(async () => { try { await recordMessage('cancel'); } catch {} await closeOffscreen(); });
 }
 async function finishVoiceResult(message) {
   const { voiceSession: saved } = await sessionStore.get('voiceSession');
-  if (!saved || saved.id !== message.sessionId || saved.contextID !== message.contextID) return;
+  if (!saved || saved.id !== message.sessionId || saved.contextID !== message.contextID) { void closeOffscreen(); return; }
   try {
+    if (!hasContext(message.contextID)) return;
     if (!message.text?.trim()) throw new Error(message.error || '语音服务未返回识别文字');
-    if (contextId >= 0 && contextId !== message.contextID) throw new Error('输入焦点已变化，识别文字未写入');
-    await ime.commitText({ contextID: message.contextID, text: message.text });
+    await commit(message.contextID, message.text);
     if (message.error) notify(`后续语音片段失败，已插入已识别部分：${message.error}`);
-  } catch (error) { notify(`语音输入失败：${focusError(error, message.contextID).message}`); }
+  } catch (error) {
+    const handled = focusError(error, message.contextID);
+    if (!isFocusLoss(handled)) notify(`语音输入失败：${handled.message}`);
+  }
   finally {
     await sessionStore.remove('voiceSession');
     voice = 'idle'; voiceContext = -1; voiceTrigger = voiceSessionId = null;
     audioLevel = 0; progressText = '';
     await render().catch(() => {});
+    void closeOffscreen();
   }
 }
 chrome.runtime.onMessage.addListener(message => {
@@ -227,30 +281,32 @@ async function handleKey(key) {
   else if (key.key === 'Backspace') composition = composition.slice(0, -1);
   else if (key.key === 'Escape') { await reset(); return; }
   else if (/^[1-9]$/.test(key.key)) { await pick(Number(key.key) - 1); return; }
-  else if (key.key === ' ' || key.key === 'Enter') { if (state?.candidates?.length) await pick(0); else { await ime.commitText({ contextID: contextId, text: composition }); await reset(); } return; }
+  else if (key.key === ' ' || key.key === 'Enter') { if (state?.candidates?.length) await pick(0); else { await commit(contextId, composition); await reset(); } return; }
   else if (['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', '-', '='].includes(key.key)) {
     const forward = ['PageDown', 'ArrowDown', '='].includes(key.key);
     state = await flip(forward);
     await render(); return;
   }
   state = await input(composition);
-  if (state?.committed) { await ime.commitText({ contextID: contextId, text: state.committed }); await reset(); }
+  if (state?.committed) { await commit(contextId, state.committed); await reset(); }
   else await render();
 }
 
-ime.onActivate.addListener(engine => { active = engine === ENGINE_ID; });
-ime.onDeactivated.addListener(() => { discardRecording(); active = false; contextId = -1; generation++; composition = ''; state = null; void sessionStore.remove('currentContextID').catch(() => {}); });
-ime.onFocus.addListener(context => {
+function focus(context) {
   if (contextId >= 0 && context.contextID !== contextId) discardRecording();
   contextId = context.contextID; contextType = context.type; generation++; composition = ''; state = null;
   void sessionStore.set({ currentContextID: contextId }).catch(() => {});
   void enqueue(reset);
-});
-ime.onBlur.addListener(id => { if (id === contextId) { discardRecording(); contextId = -1; generation++; composition = ''; state = null; void sessionStore.remove('currentContextID').catch(() => {}); void enqueue(clear); } });
+}
+ime.onActivate.addListener(engine => { active = engine === ENGINE_ID; if (active && latestFocus) focus(latestFocus); });
+ime.onDeactivated.addListener(engine => { if (engine !== ENGINE_ID) return; discardRecording(); active = false; contextId = -1; generation++; composition = ''; state = null; void sessionStore.remove('currentContextID').catch(() => {}); });
+ime.onFocus.addListener(context => { latestFocus = context; if (active) focus(context); });
+ime.onBlur.addListener(id => { if (latestFocus?.contextID === id) latestFocus = null; if (id === contextId) { discardRecording(); contextId = -1; generation++; composition = ''; state = null; void sessionStore.remove('currentContextID').catch(() => {}); void enqueue(clear); } });
 ime.onCandidateClicked.addListener((_engine, id) => { void enqueue(() => pick(id)); });
 ime.onKeyEvent.addListener((engine, key, requestId) => {
   if (engine !== ENGINE_ID) return false;
   active = true;
+  if (contextId < 0 && latestFocus) focus(latestFocus);
   if (altHold.handle(key)) return false;
   if (shiftToggle.handle(key)) return false;
   if (key.code === 'KeyL' && key.type === 'keyup' && altLDown) { altLDown = false; return true; }

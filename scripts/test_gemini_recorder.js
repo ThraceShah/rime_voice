@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { installAudioWorkletMock } from './mock_audio_worklet.js';
 
-let listener, processor, limitCallback, requestCount = 0, stoppedTracks = 0;
+let listener, limitCallback, requestCount = 0, stoppedTracks = 0;
 const messages = [];
 const originalTimeout = globalThis.setTimeout;
 globalThis.setTimeout = (callback, delay, ...args) => {
@@ -8,19 +9,14 @@ globalThis.setTimeout = (callback, delay, ...args) => {
   return originalTimeout(callback, delay, ...args);
 };
 globalThis.chrome = { runtime: {
+  getURL: path => `chrome-extension://test/${path}`,
   onMessage: { addListener: callback => { listener = callback; } },
   sendMessage: async message => { messages.push(message); }
 } };
 Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { mediaDevices: {
   getUserMedia: async () => ({ getTracks: () => [{ stop: () => { stoppedTracks++; } }] })
 } } });
-globalThis.AudioContext = class {
-  sampleRate = 48000;
-  destination = {};
-  createMediaStreamSource() { return { connect: () => {}, disconnect: () => {} }; }
-  createScriptProcessor() { processor = { connect: () => {}, disconnect: () => {}, onaudioprocess: null }; return processor; }
-  async close() {}
-};
+const audio = installAudioWorkletMock({ sampleRate: 48000 });
 globalThis.fetch = async (_url, init) => {
   requestCount++;
   const body = JSON.parse(init.body);
@@ -40,9 +36,10 @@ try {
   const settings = { provider: 'Gemini', geminiApiKey: 'test', smartMode: true };
   assert((await send({ type: 'start', sessionId: 'gemini-test', contextID: 5, trigger: 'toggle', settings })).ok);
   const frame = new Float32Array(4096).fill(0.08);
-  for (let i = 0; i < 15; i++) processor.onaudioprocess({ inputBuffer: { numberOfChannels: 1, length: frame.length, getChannelData: () => frame } });
+  for (let i = 0; i < 15; i++) audio.emit(frame);
   assert(limitCallback, '缺少10分钟自动结束计时器');
   limitCallback();
+  assert((await send({ type: 'stop' })).ok, '到达录音上限时再次结束应安全返回');
   for (let i = 0; i < 200 && !messages.some(message => message.type === 'voice-result'); i++) await new Promise(resolve => originalTimeout(resolve, 10));
   assert(messages.some(message => message.type === 'voice-auto-stopped'));
   assert.equal(messages.find(message => message.type === 'voice-result')?.text, '测试成功。');

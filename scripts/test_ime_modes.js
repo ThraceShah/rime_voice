@@ -16,7 +16,7 @@ const base = `http://127.0.0.1:${server.address().port}/`;
 const listeners = {}, replies = new Map(), storage = {};
 const notifications = [];
 let committed = '', composition = '', candidates = [], windowVisible = false, requestNo = 0;
-let recording = false, processing = false, recorderSession, failVoiceRender = false, cancelCount = 0;
+let recording = false, processing = false, recorderSession, failVoiceRender = '', cancelCount = 0, offscreenOpen = false;
 const event = name => ({ addListener: callback => { listeners[name] = callback; } });
 globalThis.chrome = {
   storage: { local: {
@@ -29,7 +29,7 @@ globalThis.chrome = {
   } },
   runtime: {
     getURL: path => base + path,
-    getContexts: async () => [{}],
+    getContexts: async () => offscreenOpen ? [{}] : [],
     onMessage: event('message'),
     sendMessage: async message => {
       if (message.type === 'status') return { ok: true, data: { recording, processing, session: recorderSession } };
@@ -47,11 +47,17 @@ globalThis.chrome = {
     }
   },
   notifications: { create: details => { notifications.push(details.message); } },
+  offscreen: {
+    createDocument: async () => { offscreenOpen = true; },
+    closeDocument: async () => { offscreenOpen = false; }
+  },
   input: { ime: {
     onActivate: event('activate'), onDeactivated: event('deactivated'), onFocus: event('focus'),
     onBlur: event('blur'), onCandidateClicked: event('candidate'), onKeyEvent: event('key'),
     setComposition: async value => {
-      if (failVoiceRender && value.text.startsWith('🎙')) throw new Error('[input.ime.setComposition]: Context is not active. request context id = 1, current context id = -1');
+      if (failVoiceRender && value.text.startsWith('🎙')) throw new Error(failVoiceRender === 'engine'
+        ? '[input.ime.setComposition]: The engine is not active.'
+        : '[input.ime.setComposition]: Context is not active. request context id = 1, current context id = -1');
       if (value.cursor > Array.from(value.text).length) throw new Error('ChromeOS IME 光标越界');
       composition = value.text;
     },
@@ -66,6 +72,7 @@ try {
   await import('../src/background/index.js');
   listeners.activate('rime_mimo_ime');
   listeners.focus({ contextID: 1, type: 'text' });
+  assert.equal(offscreenOpen, false, '普通中文输入不应打开录音页');
   async function send(key, type = 'keydown', extras = {}) {
     const id = String(++requestNo);
     const reply = new Promise(resolve => replies.set(id, resolve));
@@ -109,6 +116,7 @@ try {
   assert.equal(await send('l', 'keyup', { altKey: true }), true);
   await waitUntil(() => committed.includes('语音测试。'));
   assert.equal(recording, false);
+  await waitUntil(() => !offscreenOpen);
   assert.equal(await send('l', 'keydown', { altKey: true }), true);
   assert.equal(await send('l', 'keyup', { altKey: true }), true);
   await waitUntil(() => recording);
@@ -129,11 +137,44 @@ try {
   await waitUntil(() => recording && composition.includes('右 Alt'));
   await send('Alt', 'keyup', { code: 'AltRight', altKey: false });
   await waitUntil(() => committed.split('语音测试。').length === 5);
-  failVoiceRender = true;
+  failVoiceRender = 'context';
   assert.equal(await send('l', 'keydown', { altKey: true }), true);
   assert.equal(await send('l', 'keyup', { altKey: true }), true);
-  await waitUntil(() => cancelCount > 0);
-  assert.equal(recording, false, '状态渲染失败后麦克风应释放');
-  assert(notifications.some(message => message.includes('重新点击输入框')), '失焦错误应显示友好提示');
-  console.log('中英文切换、紧凑录音状态、Alt+L 与 Worker 重启后停止测试通过');
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(recording, false, '无效焦点不得启动麦克风');
+  assert.equal(offscreenOpen, false, '无效焦点不得创建录音页');
+  assert.equal(notifications.length, 0, '失焦和引擎停用不应弹出通知');
+  failVoiceRender = 'engine';
+  listeners.activate('rime_mimo_ime');
+  listeners.focus({ contextID: 2, type: 'text' });
+  assert.equal(await send('l', 'keydown', { altKey: true }), true);
+  assert.equal(await send('l', 'keyup', { altKey: true }), true);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(recording, false);
+  assert.equal(offscreenOpen, false);
+  assert.equal(notifications.length, 0, '引擎停用不应弹出通知');
+  failVoiceRender = '';
+  listeners.activate('rime_mimo_ime');
+  listeners.focus({ contextID: 3, type: 'text' });
+  assert.equal(await send('l', 'keydown', { altKey: true }), true);
+  assert.equal(await send('l', 'keyup', { altKey: true }), true);
+  await waitUntil(() => recording);
+  listeners.blur(3);
+  await waitUntil(() => !recording && !offscreenOpen);
+  assert.equal(notifications.length, 0, '录音中失焦应静默取消');
+  await waitUntil(() => !storage.currentContextID);
+  assert.equal(await send('l', 'keydown', { altKey: true }), true);
+  assert.equal(await send('l', 'keyup', { altKey: true }), true);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(offscreenOpen, false, '无焦点时快捷键不得打开录音页');
+  assert.equal(notifications.length, 0, '无焦点时快捷键应静默忽略');
+  listeners.deactivated('rime_mimo_ime');
+  listeners.focus({ contextID: 4, type: 'text' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(offscreenOpen, false, '未激活输入法时不得打开录音页');
+  listeners.activate('rime_mimo_ime');
+  listeners.blur(4);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(notifications.length, 0, '普通失焦不应弹出通知');
+  console.log('中英文切换、录音状态、失焦静默取消和麦克风释放测试通过');
 } finally { server.close(); }

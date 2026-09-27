@@ -1,25 +1,21 @@
 import assert from 'node:assert/strict';
+import { installAudioWorkletMock } from './mock_audio_worklet.js';
 
-let listener, processor, geminiCalls = 0, mimoCalls = 0, failureMode = 'network';
+let listener, geminiCalls = 0, mimoCalls = 0, failureMode = 'network';
 const messages = [];
 const originalTimeout = globalThis.setTimeout;
 globalThis.setTimeout = (callback, delay, ...args) => delay === 20000
   ? originalTimeout(callback, 0)
   : originalTimeout(callback, delay, ...args);
 globalThis.chrome = { runtime: {
+  getURL: path => `chrome-extension://test/${path}`,
   onMessage: { addListener: callback => { listener = callback; } },
   sendMessage: async message => { messages.push(message); }
 } };
 Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { mediaDevices: {
   getUserMedia: async () => ({ getTracks: () => [{ stop: () => {} }] })
 } } });
-globalThis.AudioContext = class {
-  sampleRate = 16000;
-  destination = {};
-  createMediaStreamSource() { return { connect: () => {}, disconnect: () => {} }; }
-  createScriptProcessor() { processor = { connect: () => {}, disconnect: () => {}, onaudioprocess: null }; return processor; }
-  async close() {}
-};
+const audio = installAudioWorkletMock({ sampleRate: 16000 });
 globalThis.fetch = async (url, options) => {
   if (String(url).includes('generativelanguage.googleapis.com')) {
     geminiCalls++;
@@ -45,7 +41,7 @@ const settings = {
 };
 assert((await send({ type: 'start', sessionId: 'fallback-test', contextID: 7, trigger: 'toggle', settings })).ok);
 const frame = new Float32Array(4096).fill(0.08);
-for (let i = 0; i < 352; i++) processor.onaudioprocess({ inputBuffer: { numberOfChannels: 1, length: frame.length, getChannelData: () => frame } });
+for (let i = 0; i < 352; i++) audio.emit(frame);
 assert((await send({ type: 'stop' })).ok);
 for (let i = 0; i < 200 && !messages.some(message => message.type === 'voice-result'); i++) await new Promise(resolve => setTimeout(resolve, 10));
 const result = messages.find(message => message.type === 'voice-result');
@@ -56,7 +52,7 @@ assert.equal(mimoCalls, 2);
 failureMode = 'timeout';
 messages.length = 0;
 assert((await send({ type: 'start', sessionId: 'timeout-test', contextID: 7, trigger: 'toggle', settings })).ok);
-for (let i = 0; i < 6; i++) processor.onaudioprocess({ inputBuffer: { numberOfChannels: 1, length: frame.length, getChannelData: () => frame } });
+for (let i = 0; i < 6; i++) audio.emit(frame);
 assert((await send({ type: 'stop' })).ok);
 for (let i = 0; i < 200 && !messages.some(message => message.type === 'voice-result'); i++) await new Promise(resolve => originalTimeout(resolve, 10));
 assert.equal(messages.find(message => message.type === 'voice-result')?.text, '片段3');
